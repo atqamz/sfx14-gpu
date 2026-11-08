@@ -1,0 +1,16 @@
+[Unit]
+Description=Pin the NVIDIA dGPU clocks for gaming
+Documentation=https://github.com/atqamz/sfx14-gpu
+After=multi-user.target
+ConditionPathExists=/usr/bin/nvidia-smi
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/sfx14-gpu game on
+ExecStop=/usr/local/bin/sfx14-gpu game off
+
+# No [Install]: enabling this at boot would pin clocks all the time.
+# Start and stop it around a gaming session instead:
+#   sudo systemctl start sfx14-gpu-game.service
+#   sudo systemctl stop sfx14-gpu-game.service

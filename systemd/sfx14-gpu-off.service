@@ -1,0 +1,12 @@
+[Unit]
+Description=Put the NVIDIA dGPU in the Acer Swift X 14 into D3cold
+Documentation=https://github.com/atqamz/sfx14-gpu
+After=multi-user.target
+ConditionPathExists=/usr/bin/nvidia-smi
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sfx14-gpu off
+
+[Install]
+WantedBy=multi-user.target
