@@ -51,12 +51,12 @@ add_compositor 111 Hyprland
 sfx off
 assert_status 1 "off refuses while an unconfigured compositor holds the GPU"
 assert_contains "refusing" "off explains the compositor refusal"
-assert_contains "AQ_DRM_DEVICES=/dev/dri/card0" "off gives the compositor next step"
+assert_contains "AQ_DRM_DEVICES=/dev/dri/by-path/pci-0000:00:02.0-card" "off gives the stable compositor next step"
 assert_file_not_contains "$LOG" "nvidia-smi -pm 0" "off does not touch persistence after a compositor refusal"
 
 new_env
 set_runtime active
-add_compositor 111 Hyprland /dev/dri/card0
+add_compositor 111 Hyprland /dev/dri/by-path/pci-0000:00:02.0-card
 EXTRA_ENV=(SFX14_FAKE_PM0_SUSPENDS=1)
 sfx off
 assert_status 0 "off proceeds when the compositor already ignores the dGPU"
@@ -71,7 +71,8 @@ set_runtime active
 add_compositor 111 Hyprland
 sfx off
 assert_status 1 "off refuses an unconfigured compositor with shifted card numbers"
-assert_contains "AQ_DRM_DEVICES=/dev/dri/card2" "off derives the iGPU card number instead of assuming card0"
+assert_contains "AQ_DRM_DEVICES=/dev/dri/by-path/pci-0000:00:02.0-card" "off derives the stable iGPU path with shifted card numbers"
+assert_not_contains "AQ_DRM_DEVICES=/dev/dri/card" "off never recommends a numeric card node"
 
 new_env
 set_runtime active
@@ -83,6 +84,14 @@ assert_contains "still active after 1s" "off reports the poll timeout"
 assert_contains "persistence" "off names the remaining persistence holder"
 assert_contains "Next steps:" "off prints next steps"
 assert_file_contains "$LOG" "nvidia-smi -pm 0" "off attempted to disable persistence"
+
+new_env
+set_runtime active
+POLL_TIMEOUT=1.5
+sfx off
+assert_status 1 "off rejects a fractional poll timeout"
+assert_contains "SFX14_POLL_TIMEOUT must be a whole number of seconds" "off explains the bad poll timeout"
+assert_file_empty "$LOG" "off runs nothing with a bad poll timeout"
 
 new_env
 set_runtime active

@@ -168,6 +168,13 @@ case ${1:-} in
     IFS=', '
     echo "${out[*]}"
     ;;
+  -q)
+    # Harmless read: like the real driver, it resumes a suspended device
+    # unless the test asks for the honest "still suspended" path.
+    if [ "${SFX14_FAKE_QUERY_STAYS_SUSPENDED:-0}" != 1 ]; then
+      printf 'active\n' > "$state"
+    fi
+    ;;
   -pm)
     case ${2:-} in
       0)
@@ -178,7 +185,9 @@ case ${1:-} in
         ;;
       1)
         printf 'Enabled\n' > "$root/pm"
-        printf 'active\n' > "$state"
+        if [ "${SFX14_FAKE_PM1_STAYS_SUSPENDED:-0}" != 1 ]; then
+          printf 'active\n' > "$state"
+        fi
         ;;
       *)
         echo "unexpected -pm argument" >&2

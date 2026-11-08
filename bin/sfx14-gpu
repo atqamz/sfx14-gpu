@@ -27,7 +27,7 @@ DEV=""
 GPU_MODEL=""
 RUNTIME_STATUS="unknown"
 POWER_CONTROL="unknown"
-PERSISTENCE="unavailable"
+PERSISTENCE=""
 CLOCK_GR=""
 CLOCK_MEM=""
 POWER_DRAW=""
@@ -38,7 +38,8 @@ declare -a CLIENT_PIDS=() CLIENT_COMMS=() CLIENT_DEVS=()
 declare -a COMP_PIDS=() COMP_COMMS=() COMP_AQS=() COMP_NODES=()
 declare -a NVIDIA_CARDS=()
 declare -a HELD_BY=()
-IGPU_CARD=""
+IGPU_BDF=""
+CLIENT_UNREADABLE=0
 
 COMPOSITOR_NAMES=" Hyprland sway gnome-shell kwin_wayland kwin_x11 Xorg Xwayland weston labwc river wayfire niri cosmic-comp mutter "
 
@@ -65,7 +66,8 @@ commands:
   status [--json]        show runtime state, holders and a verdict (read-only)
   off [--force]          disable persistence and let the dGPU suspend
   on [--persist|--no-persist]
-                         load the NVIDIA modules and wake the dGPU
+                         load the NVIDIA modules, wake the dGPU and verify it
+                         (--no-persist uses a read-only nvidia-smi query)
   game on|off            pin clocks for gaming / restore idle behaviour
   help                   show this help
 
@@ -163,7 +165,7 @@ power_control() {
 
 query_gpu() {
   local line persist gr mem draw
-  PERSISTENCE=unavailable
+  PERSISTENCE=""
   CLOCK_GR=""
   CLOCK_MEM=""
   POWER_DRAW=""
@@ -175,7 +177,6 @@ query_gpu() {
   CLOCK_GR=$(trim "${gr:-}")
   CLOCK_MEM=$(trim "${mem:-}")
   POWER_DRAW=$(trim "${draw:-}")
-  [ -n "$PERSISTENCE" ] || PERSISTENCE=unavailable
 }
 
 nvidia_proc_info() {
@@ -192,60 +193,89 @@ nvidia_proc_info() {
 }
 
 scan_drm_cards() {
-  local dir target base vendor
+  local dir target name vendor
   NVIDIA_CARDS=()
-  IGPU_CARD=""
-  for dir in "$SYSFS"/class/drm/card[0-9]*; do
-    [ -e "$dir/device" ] || continue
-    target=$(readlink -f "$dir/device" 2>/dev/null || true)
-    [ -n "$target" ] || continue
-    base=${target##*/}
-    if [ "$base" = "$BDF" ]; then
-      NVIDIA_CARDS+=("${dir##*/}")
+  IGPU_BDF=""
+  for dir in "$SYSFS"/class/drm/card*; do
+    [ -d "$dir" ] || continue
+    name=${dir##*/}
+    # /sys/class/drm also holds connectors (card0-HDMI-A-1, card0-eDP-1);
+    # only real card nodes have a purely numeric suffix.
+    if [[ ! $name =~ ^card[0-9]+$ ]]; then
       continue
     fi
-    vendor=$(read_file "$dir/device/vendor" 2>/dev/null || true)
+    target=$(readlink -f "$dir/device" 2>/dev/null || true)
+    [ -n "$target" ] || continue
+    if [ "${target##*/}" = "$BDF" ]; then
+      NVIDIA_CARDS+=("$name")
+      continue
+    fi
+    vendor=$(read_file "$target/vendor" 2>/dev/null || true)
     if [ "$vendor" = 0x8086 ]; then
-      IGPU_CARD=${dir##*/}
-    elif [ -z "$IGPU_CARD" ]; then
-      IGPU_CARD=${dir##*/}
+      IGPU_BDF=${target##*/}
     fi
   done
+  if [ -z "$IGPU_BDF" ]; then
+    die "no Intel iGPU (vendor 8086) found under $SYSFS/class/drm; cannot derive a stable AQ_DRM_DEVICES path"
+  fi
 }
 
 aq_device() {
-  printf '/dev/dri/%s' "${IGPU_CARD:-card0}"
+  printf '/dev/dri/by-path/pci-%s-card' "$IGPU_BDF"
 }
 
 scan_clients() {
-  local fd pid comm target key
+  local dir fd pid comm target key
   local -A seen=()
   CLIENT_PIDS=()
   CLIENT_COMMS=()
   CLIENT_DEVS=()
-  for fd in "$PROC"/[0-9]*/fd/*; do
-    [ -L "$fd" ] || continue
-    target=$(readlink "$fd" 2>/dev/null) || continue
-    case $target in
-      /dev/nvidia*) ;;
-      *) continue ;;
-    esac
-    pid=${fd#"$PROC"/}
-    pid=${pid%%/*}
-    case $pid in
-      ''|*[!0-9]*) continue ;;
-    esac
-    [ "$pid" = "$$" ] && continue
-    key=$pid:$target
-    if [ -n "${seen[$key]:-}" ]; then
+  CLIENT_UNREADABLE=0
+  for dir in "$PROC"/[0-9]*; do
+    [ -d "$dir" ] || continue
+    pid=${dir##*/}
+    if [ ! -r "$dir/fd" ] || [ ! -x "$dir/fd" ]; then
+      CLIENT_UNREADABLE=$((CLIENT_UNREADABLE + 1))
       continue
     fi
-    seen[$key]=1
-    comm=$(read_file "$PROC/$pid/comm" 2>/dev/null || true)
-    CLIENT_PIDS+=("$pid")
-    CLIENT_COMMS+=("${comm:-?}")
-    CLIENT_DEVS+=("$target")
+    for fd in "$dir"/fd/*; do
+      [ -L "$fd" ] || continue
+      target=$(readlink "$fd" 2>/dev/null) || continue
+      case $target in
+        /dev/nvidia*) ;;
+        *) continue ;;
+      esac
+      [ "$pid" = "$$" ] && continue
+      key=$pid:$target
+      if [ -n "${seen[$key]:-}" ]; then
+        continue
+      fi
+      seen[$key]=1
+      comm=$(read_file "$PROC/$pid/comm" 2>/dev/null || true)
+      CLIENT_PIDS+=("$pid")
+      CLIENT_COMMS+=("${comm:-?}")
+      CLIENT_DEVS+=("$target")
+    done
   done
+}
+
+# Describes why the holder list may be incomplete: unreadable /proc entries
+# and, only when it would help, the root hint.
+unknown_holders_suffix() {
+  local parts=""
+  if [ "$CLIENT_UNREADABLE" -gt 0 ]; then
+    parts="$CLIENT_UNREADABLE process(es) could not be inspected"
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    if [ -n "$parts" ]; then
+      parts="$parts; run as root for /proc details"
+    else
+      parts="run as root for /proc details"
+    fi
+  fi
+  if [ -n "$parts" ]; then
+    printf ' (%s)' "$parts"
+  fi
 }
 
 is_compositor() {
@@ -374,7 +404,7 @@ print_status_human() {
   printf '%-15s %s\n' 'GPU:' "$BDF${GPU_MODEL:+ ($GPU_MODEL)}"
   printf '%-15s %s\n' 'runtime_status:' "$RUNTIME_STATUS"
   printf '%-15s %s\n' 'power/control:' "$POWER_CONTROL"
-  printf '%-15s %s\n' 'persistence:' "$PERSISTENCE"
+  printf '%-15s %s\n' 'persistence:' "${PERSISTENCE:-unavailable}"
   if [ -n "$CLOCK_GR" ]; then
     printf '%-15s %s\n' 'clocks:' "graphics $CLOCK_GR, memory $CLOCK_MEM, $POWER_DRAW"
   else
@@ -392,7 +422,7 @@ print_status_human() {
   elif [ "${#HELD_BY[@]}" -gt 0 ]; then
     printf 'dGPU active — held by %s\n' "$(join_by ', ' "${HELD_BY[@]}")"
   else
-    printf 'dGPU active — held by unknown (run as root for /proc details)\n'
+    printf 'dGPU active — held by unknown%s\n' "$(unknown_holders_suffix)"
   fi
 }
 
@@ -403,7 +433,7 @@ print_status_json() {
   printf '  "gpu": %s,\n' "$(json_string_or_null "$GPU_MODEL")"
   printf '  "runtime_status": "%s",\n' "$(json_escape "$RUNTIME_STATUS")"
   printf '  "power_control": "%s",\n' "$(json_escape "$POWER_CONTROL")"
-  printf '  "persistence_mode": "%s",\n' "$(json_escape "$PERSISTENCE")"
+  printf '  "persistence_mode": %s,\n' "$(json_string_or_null "$PERSISTENCE")"
   printf '  "clocks": {"graphics": %s, "memory": %s},\n' \
     "$(json_string_or_null "$CLOCK_GR")" "$(json_string_or_null "$CLOCK_MEM")"
   printf '  "power_draw": %s,\n' "$(json_string_or_null "$POWER_DRAW")"
@@ -505,7 +535,7 @@ print_off_failure() {
       printf '  - %s\n' "${HELD_BY[$index]}" >&2
     done
   else
-    printf 'remaining holders: none visible (run as root for /proc details)\n' >&2
+    printf 'remaining holders: none visible%s\n' "$(unknown_holders_suffix)" >&2
   fi
   printf 'Next steps:\n' >&2
   if [ "${#CLIENT_PIDS[@]}" -gt 0 ]; then
@@ -525,18 +555,34 @@ print_off_failure() {
   fi
 }
 
-poll_suspended() {
-  local deadline=$((SECONDS + POLL_TIMEOUT))
+validate_poll_timeout() {
+  case $POLL_TIMEOUT in
+    ''|*[!0-9]*)
+      die "SFX14_POLL_TIMEOUT must be a whole number of seconds (got '$POLL_TIMEOUT')"
+      ;;
+  esac
+  POLL_TIMEOUT=$((10#$POLL_TIMEOUT))
+}
+
+# Wait up to POLL_TIMEOUT whole seconds for runtime_status to become $1.
+poll_for_state() {
+  local want=$1 deadline=$((SECONDS + POLL_TIMEOUT))
   while :; do
-    if [ "$(runtime_status)" = suspended ]; then
-      printf 'dGPU suspended (D3cold)\n'
+    if [ "$(runtime_status)" = "$want" ]; then
       return 0
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
-      break
+      return 1
     fi
     sleep "$POLL_INTERVAL"
   done
+}
+
+poll_suspended() {
+  if poll_for_state suspended; then
+    printf 'dGPU suspended (D3cold)\n'
+    return 0
+  fi
   print_off_failure
   return 1
 }
@@ -549,6 +595,7 @@ cmd_off() {
       *) die "unknown option for off: $arg" ;;
     esac
   done
+  validate_poll_timeout
   detect_bdf
   scan_drm_cards
   status=$(runtime_status)
@@ -585,6 +632,7 @@ cmd_on() {
       *) die "unknown option for on: $arg" ;;
     esac
   done
+  validate_poll_timeout
   detect_bdf
   if ! module_loaded nvidia_drm || ! module_loaded nvidia; then
     need_modprobe=1
@@ -596,6 +644,8 @@ cmd_on() {
     if [ "$PERSIST" -eq 1 ]; then
       printf 'would run: %s -pm 1\n' "$NVIDIA_SMI"
     else
+      printf 'would run: %s -q (read-only wake)\n' "$NVIDIA_SMI"
+      printf 'would poll %s for up to %ss\n' "$DEV/power/runtime_status" "$POLL_TIMEOUT"
       printf 'persistence left off (--no-persist)\n'
     fi
     return 0
@@ -608,9 +658,23 @@ cmd_on() {
   if [ "$PERSIST" -eq 1 ]; then
     have_nvidia_smi || die "nvidia-smi not found ($NVIDIA_SMI)"
     timeout 5 "$NVIDIA_SMI" -pm 1 || die 'nvidia-smi -pm 1 failed'
-    printf 'dGPU active (persistence enabled)\n'
+    if poll_for_state active; then
+      printf 'dGPU active (persistence enabled)\n'
+    else
+      printf 'dGPU not active after %ss (runtime_status=%s); persistence is enabled\n' \
+        "$POLL_TIMEOUT" "$(runtime_status)"
+      return 1
+    fi
   else
-    printf 'dGPU active; persistence left off (--no-persist)\n'
+    # A read (not -pm 1) is enough to resume the device; report what actually
+    # happened instead of claiming success unconditionally.
+    have_nvidia_smi || die "nvidia-smi not found ($NVIDIA_SMI)"
+    timeout 5 "$NVIDIA_SMI" -q >/dev/null 2>&1 || warn 'nvidia-smi -q failed; cannot verify the wake'
+    if poll_for_state active; then
+      printf 'dGPU active; persistence left off (--no-persist)\n'
+    else
+      printf 'dGPU still suspended; persistence left off (--no-persist) — a client that opens /dev/nvidia* will wake it\n'
+    fi
   fi
 }
 
@@ -640,14 +704,29 @@ cmd_game_on() {
 }
 
 cmd_game_off() {
+  local state
   [ "$#" -eq 0 ] || die "unknown option for game off: $1"
+  detect_bdf
+  state=$(runtime_status)
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'would run: %s -rgc\n' "$NVIDIA_SMI"
+    if [ "$state" = suspended ]; then
+      printf 'would skip: %s -rgc (dGPU suspended)\n' "$NVIDIA_SMI"
+    else
+      printf 'would run: %s -rgc\n' "$NVIDIA_SMI"
+    fi
     printf 'would run: %s -pm 0\n' "$NVIDIA_SMI"
     return 0
   fi
   require_root game || return 1
   have_nvidia_smi || die "nvidia-smi not found ($NVIDIA_SMI)"
+  if [ "$state" = suspended ]; then
+    printf 'dGPU suspended (D3cold); skipping -rgc — a suspended GPU has no clock cap to reset\n'
+    if ! timeout 5 "$NVIDIA_SMI" -pm 0; then
+      warn 'nvidia-smi -pm 0 failed on the suspended GPU; assuming persistence is off'
+    fi
+    printf 'game profile disabled: clocks already unrestricted, persistence off\n'
+    return 0
+  fi
   timeout 5 "$NVIDIA_SMI" -rgc || die 'nvidia-smi -rgc failed'
   timeout 5 "$NVIDIA_SMI" -pm 0 || die 'nvidia-smi -pm 0 failed'
   printf 'game profile disabled: clocks reset, persistence off\n'

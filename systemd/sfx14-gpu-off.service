@@ -1,7 +1,8 @@
 [Unit]
 Description=Put the NVIDIA dGPU in the Acer Swift X 14 into D3cold
 Documentation=https://github.com/atqamz/sfx14-gpu
-After=multi-user.target
+After=systemd-modules-load.service
+Before=graphical.target
 ConditionPathExists=/usr/bin/nvidia-smi
 
 [Service]
